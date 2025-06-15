@@ -2,9 +2,12 @@ from homeassistant.components.air_quality import AirQualityEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from datetime import datetime, timedelta, timezone
 import logging
 import asyncio
+
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -19,6 +22,7 @@ class GoogleAQIAirQualityEntity(AirQualityEntity):
     def __init__(
         self,
         hass,
+        entry_id,
         api_key,
         latitude,
         longitude,
@@ -28,6 +32,7 @@ class GoogleAQIAirQualityEntity(AirQualityEntity):
         forecast_length,
     ):
         self.hass = hass
+        self._entry_id = entry_id
         self._api_key = api_key
         self._latitude = latitude
         self._longitude = longitude
@@ -55,6 +60,16 @@ class GoogleAQIAirQualityEntity(AirQualityEntity):
     def name(self):
         """Return the name of the sensor."""
         return "Google AQI Sensor"
+
+    @property
+    def device_info(self):
+        """Return information about the device this entity belongs to."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry_id)},
+            name="Google AQI",
+            manufacturer="Google",
+            entry_type=DeviceEntryType.SERVICE,
+        )
 
     @property
     def state(self):
@@ -347,6 +362,7 @@ async def async_setup_entry(
         [
             GoogleAQIAirQualityEntity(
                 hass,
+                config_entry.entry_id,
                 api_key=config["api_key"],
                 latitude=config["latitude"],
                 longitude=config["longitude"],
