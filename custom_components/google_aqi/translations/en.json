@@ -9,15 +9,17 @@
           "api_key": "API Key",
           "latitude": "Latitude",
           "longitude": "Longitude",
-          "interval": "Update Interval (minutes)",
+          "interval": "Update Interval (hours)",
           "forecast_interval": "Forecast Interval (hours)",
-          "forecast_length": "Forecast Length (hours)"
+          "forecast_length": "Forecast Length (hours)",
+          "get_additional_info": "Include Additional Info"
         }
       }
     },
     "error": {
       "max_length_96": "Forecast length cannot exceed 96 hours.",
-      "invalid_interval": "Interval must be between 1 and 24 hours."
+      "invalid_update_interval": "Update interval must be between 3 and 24 hours.",
+      "invalid_forecast_interval": "Forecast interval must be between 1 and 24 hours."
     }
   },
   "services": {

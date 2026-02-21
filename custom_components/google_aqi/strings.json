@@ -17,7 +17,8 @@
     },
     "error": {
       "max_length_96": "Forecast length must not exceed 96 hours.",
-      "invalid_interval": "Interval must be between 1 and 24 hours."
+      "invalid_update_interval": "Update interval must be between 3 and 24 hours.",
+      "invalid_forecast_interval": "Forecast interval must be between 1 and 24 hours."
     }
   }
 }

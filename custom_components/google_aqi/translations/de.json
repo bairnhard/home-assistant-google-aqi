@@ -9,7 +9,7 @@
           "api_key": "API-Key",
           "latitude": "Breitengrad",
           "longitude": "Längengrad",
-          "interval": "Aktualisierungsintervall (Minuten)",
+          "interval": "Aktualisierungsintervall (Stunden)",
           "forecast_interval": "Prognoseintervall (Stunden)",
           "forecast_length": "Prognoselänge (Stunden)",
           "get_additional_info": "Zusätzliche Informationen einbeziehen"
@@ -18,7 +18,8 @@
     },
     "error": {
       "max_length_96": "Die Prognoselänge darf 96 Stunden nicht überschreiten.",
-      "invalid_interval": "Das Intervall muss zwischen 1 und 24 Stunden liegen."
+      "invalid_update_interval": "Das Aktualisierungsintervall muss zwischen 3 und 24 Stunden liegen.",
+      "invalid_forecast_interval": "Das Prognoseintervall muss zwischen 1 und 24 Stunden liegen."
     }
   },
   "services": {

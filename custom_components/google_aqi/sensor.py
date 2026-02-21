@@ -1,11 +1,20 @@
-from homeassistant.components.air_quality import AirQualityEntity
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import asyncio
+import logging
+from typing import Any, Callable
+
+from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
-from datetime import datetime, timedelta, timezone
-import logging
-import asyncio
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+)
 
 from .const import DOMAIN
 
@@ -16,23 +25,33 @@ FORECAST_URL = "https://airquality.googleapis.com/v1/forecast:lookup"
 SCAN_INTERVAL = timedelta(hours=3)
 
 
-class GoogleAQIAirQualityEntity(AirQualityEntity):
-    """Representation of a Google AQI air quality entity."""
+@dataclass(frozen=True, kw_only=True)
+class GoogleAQISensorDescription(SensorEntityDescription):
+    value_fn: Callable[[dict[str, Any]], Any]
+    unit_fn: Callable[[dict[str, Any]], str | None] | None = None
+
+
+class GoogleAQICoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Fetch and store Google AQI data once for all entities."""
 
     def __init__(
         self,
-        hass,
-        entry_id,
-        api_key,
-        latitude,
-        longitude,
-        get_additional_info,
-        update_interval,
-        forecast_interval,
-        forecast_length,
-    ):
-        self.hass = hass
-        self._entry_id = entry_id
+        hass: HomeAssistant,
+        *,
+        api_key: str,
+        latitude: float,
+        longitude: float,
+        get_additional_info: bool,
+        update_interval: int,
+        forecast_interval: int,
+        forecast_length: int,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="Google AQI",
+            update_interval=SCAN_INTERVAL,
+        )
         self._api_key = api_key
         self._latitude = latitude
         self._longitude = longitude
@@ -40,30 +59,286 @@ class GoogleAQIAirQualityEntity(AirQualityEntity):
         self._update_interval = update_interval
         self._forecast_interval = forecast_interval
         self._forecast_length = forecast_length
+        self._session = async_get_clientsession(hass)
 
-        self._state = None
-        self._attributes = {}
-        self._pollutants = {}
-        self._indices = []
-        self._forecast = []
-        # self._pm25 = None  # Tracks PM2.5 state
+        self._data: dict[str, Any] = {
+            "region": None,
+            "last_update": None,
+            "pollutants": {},
+            "indices": {},
+            "forecast": [],
+            "last_current_api_call": None,
+            "next_current_api_call": None,
+            "current_api_status": None,
+            "last_forecast_api_call": None,
+            "next_forecast_api_call": None,
+            "forecast_api_status": None,
+        }
 
-        # Timestamps and statuses
-        self._last_current_api_call = None
-        self._next_current_api_call = None
-        self._current_api_status = None
-        self._last_forecast_api_call = None
-        self._next_forecast_api_call = None
-        self._forecast_api_status = None
+    async def _async_update_data(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+
+        last_current = self._data["last_current_api_call"]
+        last_forecast = self._data["last_forecast_api_call"]
+
+        if last_current:
+            self._data["next_current_api_call"] = last_current + timedelta(
+                hours=self._update_interval
+            )
+        else:
+            self._data["next_current_api_call"] = now
+
+        if last_forecast:
+            self._data["next_forecast_api_call"] = last_forecast + timedelta(
+                hours=self._forecast_interval
+            )
+        else:
+            self._data["next_forecast_api_call"] = now
+
+        tasks = []
+        if not last_current or now - last_current >= timedelta(hours=self._update_interval):
+            tasks.append(self._fetch_current_data())
+
+        if not last_forecast or now - last_forecast >= timedelta(hours=self._forecast_interval):
+            tasks.append(self._fetch_forecast_data())
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        return self._data
+
+    async def _fetch_current_data(self) -> None:
+        self._data["last_current_api_call"] = datetime.now(timezone.utc)
+        payload = self._create_current_payload()
+        params = {"key": self._api_key}
+
+        try:
+            async with self._session.post(API_URL, json=payload, params=params) as response:
+                if response.status == 200:
+                    self._process_current_data(await response.json())
+                    self._data["current_api_status"] = "successful"
+                else:
+                    _LOGGER.error(
+                        "Failed to fetch current AQI data: %s - %s",
+                        response.status,
+                        await response.text(),
+                    )
+                    self._data["current_api_status"] = "error"
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.error("Error fetching current AQI data: %s", err)
+            self._data["current_api_status"] = "error"
+
+    async def _fetch_forecast_data(self) -> None:
+        self._data["last_forecast_api_call"] = datetime.now(timezone.utc)
+
+        now = datetime.now(timezone.utc)
+        next_full_hour = (now + timedelta(hours=1)).replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        payload = self._create_forecast_payload(next_full_hour)
+        params = {"key": self._api_key}
+
+        try:
+            async with self._session.post(
+                FORECAST_URL,
+                json=payload,
+                params=params,
+            ) as response:
+                if response.status == 200:
+                    self._process_forecast_data(await response.json())
+                    self._data["forecast_api_status"] = "successful"
+                else:
+                    _LOGGER.error(
+                        "Failed to fetch forecast data: %s - %s",
+                        response.status,
+                        await response.text(),
+                    )
+                    self._data["forecast_api_status"] = "error"
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.error("Error fetching forecast data: %s", err)
+            self._data["forecast_api_status"] = "error"
+
+    def _process_current_data(self, data: dict[str, Any]) -> None:
+        if not data:
+            _LOGGER.warning("Received empty current data from API")
+            return
+
+        indices: dict[str, dict[str, Any]] = {}
+        for index in data.get("indexes", []):
+            code = index.get("code")
+            if code:
+                indices[code] = index
+
+        pollutants: dict[str, dict[str, Any]] = {}
+        for pollutant in data.get("pollutants", []):
+            code = pollutant.get("code")
+            concentration = pollutant.get("concentration", {})
+            if not code:
+                continue
+            pollutants[code] = {
+                "value": concentration.get("value"),
+                "units": concentration.get("units"),
+                "sources": pollutant.get("additionalInfo", {}).get("sources"),
+                "effects": pollutant.get("additionalInfo", {}).get("effects"),
+            }
+
+        self._data["indices"] = indices
+        self._data["pollutants"] = pollutants
+        self._data["region"] = data.get("regionCode")
+        self._data["last_update"] = data.get("dateTime")
+
+    def _process_forecast_data(self, data: dict[str, Any]) -> None:
+        if not data or "hourlyForecasts" not in data:
+            _LOGGER.warning("Received empty or invalid forecast data from API")
+            self._data["forecast"] = []
+            return
+
+        forecasts = []
+        for forecast in data["hourlyForecasts"]:
+            index_uaqi = next(
+                (item for item in forecast.get("indexes", []) if item.get("code") == "uaqi"),
+                {},
+            )
+            forecasts.append(
+                {
+                    "datetime": forecast.get("dateTime"),
+                    "aqi": index_uaqi.get("aqi"),
+                    "dominant_pollutant": index_uaqi.get("dominantPollutant"),
+                }
+            )
+
+        self._data["forecast"] = forecasts
+
+    def _create_current_payload(self) -> dict[str, Any]:
+        extra_computations = [
+            "HEALTH_RECOMMENDATIONS",
+            "LOCAL_AQI",
+            "DOMINANT_POLLUTANT_CONCENTRATION",
+            "POLLUTANT_CONCENTRATION",
+        ]
+        if self._get_additional_info:
+            extra_computations.append("POLLUTANT_ADDITIONAL_INFO")
+
+        return {
+            "location": {
+                "latitude": self._latitude,
+                "longitude": self._longitude,
+            },
+            "extraComputations": extra_computations,
+        }
+
+    def _create_forecast_payload(self, start_time: datetime) -> dict[str, Any]:
+        end_time = start_time + timedelta(hours=self._forecast_length)
+        payload = {
+            "universalAqi": "true",
+            "location": {
+                "latitude": self._latitude,
+                "longitude": self._longitude,
+            },
+            "period": {
+                "startTime": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endTime": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            "languageCode": "en",
+            "extraComputations": [
+                "HEALTH_RECOMMENDATIONS",
+                "DOMINANT_POLLUTANT_CONCENTRATION",
+            ],
+            "uaqiColorPalette": "RED_GREEN",
+        }
+
+        if self._get_additional_info:
+            payload["extraComputations"].append("POLLUTANT_ADDITIONAL_INFO")
+
+        return payload
 
     @property
-    def name(self):
-        """Return the name of the sensor."""
-        return "Google AQI Sensor"
+    def get_additional_info(self) -> bool:
+        return self._get_additional_info
+
+
+SENSOR_DESCRIPTIONS: tuple[GoogleAQISensorDescription, ...] = (
+    GoogleAQISensorDescription(
+        key="aqi",
+        name="AQI",
+        value_fn=lambda data: data.get("indices", {}).get("uaqi", {}).get("aqi"),
+        icon="mdi:air-filter",
+    ),
+    GoogleAQISensorDescription(
+        key="dominant_pollutant",
+        name="Dominant Pollutant",
+        value_fn=lambda data: data.get("indices", {})
+        .get("uaqi", {})
+        .get("dominantPollutant"),
+        icon="mdi:chemical-weapon",
+    ),
+    GoogleAQISensorDescription(
+        key="pm25",
+        name="PM2.5",
+        value_fn=lambda data: data.get("pollutants", {}).get("pm25", {}).get("value"),
+        unit_fn=lambda data: data.get("pollutants", {}).get("pm25", {}).get("units"),
+        icon="mdi:blur",
+    ),
+    GoogleAQISensorDescription(
+        key="pm10",
+        name="PM10",
+        value_fn=lambda data: data.get("pollutants", {}).get("pm10", {}).get("value"),
+        unit_fn=lambda data: data.get("pollutants", {}).get("pm10", {}).get("units"),
+        icon="mdi:blur",
+    ),
+    GoogleAQISensorDescription(
+        key="co",
+        name="CO",
+        value_fn=lambda data: data.get("pollutants", {}).get("co", {}).get("value"),
+        unit_fn=lambda data: data.get("pollutants", {}).get("co", {}).get("units"),
+        icon="mdi:molecule",
+    ),
+    GoogleAQISensorDescription(
+        key="no2",
+        name="NO2",
+        value_fn=lambda data: data.get("pollutants", {}).get("no2", {}).get("value"),
+        unit_fn=lambda data: data.get("pollutants", {}).get("no2", {}).get("units"),
+        icon="mdi:molecule",
+    ),
+    GoogleAQISensorDescription(
+        key="o3",
+        name="O3",
+        value_fn=lambda data: data.get("pollutants", {}).get("o3", {}).get("value"),
+        unit_fn=lambda data: data.get("pollutants", {}).get("o3", {}).get("units"),
+        icon="mdi:molecule",
+    ),
+    GoogleAQISensorDescription(
+        key="so2",
+        name="SO2",
+        value_fn=lambda data: data.get("pollutants", {}).get("so2", {}).get("value"),
+        unit_fn=lambda data: data.get("pollutants", {}).get("so2", {}).get("units"),
+        icon="mdi:molecule",
+    ),
+)
+
+
+class GoogleAQISensor(CoordinatorEntity[GoogleAQICoordinator], SensorEntity):
+    """Sensor for one Google AQI measurement."""
+
+    entity_description: GoogleAQISensorDescription
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: GoogleAQICoordinator,
+        entry_id: str,
+        description: GoogleAQISensorDescription,
+    ) -> None:
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._entry_id = entry_id
+        self._attr_unique_id = f"{entry_id}_{description.key}"
 
     @property
-    def device_info(self):
-        """Return information about the device this entity belongs to."""
+    def device_info(self) -> DeviceInfo:
         return DeviceInfo(
             identifiers={(DOMAIN, self._entry_id)},
             name="Google AQI",
@@ -72,305 +347,74 @@ class GoogleAQIAirQualityEntity(AirQualityEntity):
         )
 
     @property
-    def state(self):
-        """Return the current PM2.5 value as the state."""
-        return self._pm25
+    def native_value(self) -> Any:
+        return self.entity_description.value_fn(self.coordinator.data)
 
     @property
-    def extra_state_attributes(self):
-        """Return additional state attributes."""
+    def native_unit_of_measurement(self) -> str | None:
+        if self.entity_description.unit_fn is None:
+            return None
+        return self.entity_description.unit_fn(self.coordinator.data)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        data = self.coordinator.data
+
+        if self.entity_description.key == "aqi":
+            return {
+                "category": data.get("indices", {}).get("uaqi", {}).get("category"),
+                "dominant_pollutant": data.get("indices", {})
+                .get("uaqi", {})
+                .get("dominantPollutant"),
+                "region": data.get("region"),
+                "last_update": data.get("last_update"),
+                "forecast": data.get("forecast"),
+                "last_current_api_call": data.get("last_current_api_call"),
+                "next_current_api_call": data.get("next_current_api_call"),
+                "current_api_status": data.get("current_api_status"),
+                "last_forecast_api_call": data.get("last_forecast_api_call"),
+                "next_forecast_api_call": data.get("next_forecast_api_call"),
+                "forecast_api_status": data.get("forecast_api_status"),
+            }
+
+        pollutant = data.get("pollutants", {}).get(self.entity_description.key)
+        if not pollutant:
+            return None
+
         attributes = {
-            "region": self._attributes.get("region"),
-            "last_update": self._attributes.get("last_update"),
-            "forecast": self._forecast,
-            "last_current_api_call": self._last_current_api_call,
-            "next_current_api_call": self._next_current_api_call,
-            "current_api_status": self._current_api_status,
-            "last_forecast_api_call": self._last_forecast_api_call,
-            "next_forecast_api_call": self._next_forecast_api_call,
-            "forecast_api_status": self._forecast_api_status,
+            "unit": pollutant.get("units"),
         }
 
-        # Include air quality indices
-        for index in self._indices:
-            attributes[f"index_{index['code']}"] = {
-                "aqi": index.get("aqi"),
-                "category": index.get("category"),
-                "dominant_pollutant": index.get("dominantPollutant"),
-            }
-
-        # Include pollutants
-        for pollutant, details in self._pollutants.items():
-            pollutant_data = {
-                "value": details.get("value"),
-                "unit": details.get("units"),
-            }
-            if self._get_additional_info:
-                pollutant_data.update(
-                    {
-                        "sources": details.get("sources"),
-                        "effects": details.get("effects"),
-                    }
-                )
-            attributes[pollutant] = pollutant_data
+        if self.coordinator.get_additional_info:
+            attributes["sources"] = pollutant.get("sources")
+            attributes["effects"] = pollutant.get("effects")
 
         return attributes
 
-    @property
-    def particulate_matter_2_5(self):
-        """Return the PM2.5 value."""
-        return self._pollutants.get("pm25", {}).get("value")
-
-    @property
-    def particulate_matter_10(self):
-        """Return the PM10 value."""
-        return self._pollutants.get("pm10", {}).get("value")
-
-    @property
-    def carbon_monoxide(self):
-        """Return the CO value."""
-        return self._pollutants.get("co", {}).get("value")
-
-    @property
-    def nitrogen_dioxide(self):
-        """Return the NO2 value."""
-        return self._pollutants.get("no2", {}).get("value")
-
-    @property
-    def ozone(self):
-        """Return the O3 value."""
-        return self._pollutants.get("o3", {}).get("value")
-
-    @property
-    def sulfur_dioxide(self):
-        """Return the SO2 value."""
-        return self._pollutants.get("so2", {}).get("value")
-
-    async def async_update(self):
-        """Fetch both current and forecast data with optimized API calls."""
-        now = datetime.now()
-        self._next_current_api_call = now + timedelta(hours=self._update_interval)
-        self._next_forecast_api_call = now + timedelta(hours=self._forecast_interval)
-
-        tasks = [self._fetch_current_data()]
-
-        if (
-            not self._last_forecast_api_call
-            or now - self._last_forecast_api_call
-            > timedelta(hours=self._forecast_interval)
-        ):
-            tasks.append(self._fetch_forecast_data())
-
-        await asyncio.gather(*tasks)
-
-    def _should_update_forecast(self):
-        """Determine whether a forecast update is needed."""
-        if not self._last_forecast_update:
-            return True
-        elapsed_time = datetime.now(timezone.utc) - self._last_forecast_update
-        return elapsed_time > timedelta(hours=self._forecast_interval)
-
-    async def _fetch_current_data(self):
-        """Fetch current conditions data."""
-        self._last_current_api_call = datetime.now()
-        payload = self._create_current_payload()
-        params = {"key": self._api_key}
-
-        try:
-            session = async_get_clientsession(self.hass)
-            async with session.post(API_URL, json=payload, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    self._process_current_data(data)
-                    self._forecast_api_status = "successful"
-                else:
-                    _LOGGER.error(
-                        f"Failed to fetch current AQI data: {response.status} - {await response.text()}"
-                    )
-        except Exception as e:
-            _LOGGER.error(f"Error fetching current AQI data: {e}")
-            self._current_api_status = "error"
-
-    async def _fetch_forecast_data(self):
-        """Fetch forecast data with correct start and end time calculation."""
-        self._last_forecast_api_call = datetime.now()
-        now = datetime.now(timezone.utc)
-        # Align `startTime` with the next full hour
-        next_full_hour = (now + timedelta(hours=1)).replace(
-            minute=0, second=0, microsecond=0
-        )
-        end_time = next_full_hour + timedelta(hours=48)  # Max allowed range is 96 hours
-
-        payload = {
-            "universalAqi": "true",
-            "location": {
-                "latitude": str(self._latitude),
-                "longitude": str(self._longitude),
-            },
-            "period": {
-                "startTime": next_full_hour.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "endTime": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
-            "languageCode": "en",
-            "extraComputations": [
-                "HEALTH_RECOMMENDATIONS",
-                "DOMINANT_POLLUTANT_CONCENTRATION",
-                "POLLUTANT_ADDITIONAL_INFO",
-            ],
-            "uaqiColorPalette": "RED_GREEN",
-        }
-        params = {"key": self._api_key}
-
-        try:
-            session = async_get_clientsession(self.hass)
-            async with session.post(
-                FORECAST_URL, json=payload, params=params
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    self._process_forecast_data(data)
-                    self._last_forecast_update = datetime.now(timezone.utc)
-                    self._forecast_api_status = "successful"
-                else:
-                    error_text = await response.text()
-                    _LOGGER.error(
-                        f"Failed to fetch forecast data: {response.status} - {error_text}"
-                    )
-                    self._forecast_api_status = "error"
-        except Exception as e:
-            _LOGGER.error(f"Error fetching forecast data: {e}")
-            self._forecast_api_status = "error"
-
-    def _process_forecast_data(self, data):
-        """Process forecast data for AQI and dominant pollutant."""
-        if not data or "hourlyForecasts" not in data:
-            _LOGGER.warning("Received empty or invalid forecast data from API")
-            self._forecast = []
-            return
-
-        self._forecast = [
-            {
-                "datetime": forecast.get("dateTime"),
-                "aqi": next(
-                    (
-                        index["aqi"]
-                        for index in forecast.get("indexes", [])
-                        if index["code"] == "uaqi"
-                    ),
-                    None,
-                ),
-                "dominant_pollutant": next(
-                    (
-                        index["dominantPollutant"]
-                        for index in forecast.get("indexes", [])
-                        if index["code"] == "uaqi"
-                    ),
-                    None,
-                ),
-            }
-            for forecast in data["hourlyForecasts"]
-        ]
-
-    def _process_current_data(self, data):
-        """Process and store current conditions data."""
-        if not data:
-            _LOGGER.warning("Received empty current data from API")
-            return
-
-        self._indices = data.get("indexes", [])
-        self._attributes["region"] = data.get("regionCode")
-        self._attributes["last_update"] = data.get("dateTime")
-
-        # Store all pollutants
-        self._pollutants = {
-            pollutant["code"]: {
-                "value": pollutant["concentration"]["value"],
-                "units": pollutant["concentration"]["units"],
-                "sources": pollutant.get("additionalInfo", {}).get("sources"),
-                "effects": pollutant.get("additionalInfo", {}).get("effects"),
-            }
-            for pollutant in data.get("pollutants", [])
-        }
-
-        # Update PM2.5 state for the main entity
-        if "pm25" in self._pollutants:
-            self._pm25 = self._pollutants["pm25"]["value"]
-
-    def _process_forecast_data(self, data):
-        """Process forecast data for AQI and dominant pollutant."""
-        if not data or "hourlyForecasts" not in data:
-            _LOGGER.warning("Received empty or invalid forecast data from API")
-            self._forecast = []
-            return
-
-        # Extract relevant forecast data
-        self._forecast = [
-            {
-                "datetime": forecast.get("dateTime"),
-                "aqi": next(
-                    (
-                        index["aqi"]
-                        for index in forecast.get("indexes", [])
-                        if index["code"] == "uaqi"
-                    ),
-                    None,
-                ),
-                "dominant_pollutant": next(
-                    (
-                        index["dominantPollutant"]
-                        for index in forecast.get("indexes", [])
-                        if index["code"] == "uaqi"
-                    ),
-                    None,
-                ),
-            }
-            for forecast in data["hourlyForecasts"]
-        ]
-
-    def _create_current_payload(self):
-        """Create the payload for the current conditions API call."""
-        return {
-            "location": {"latitude": self._latitude, "longitude": self._longitude},
-            "extraComputations": [
-                "HEALTH_RECOMMENDATIONS",
-                "LOCAL_AQI",
-                "POLLUTANT_ADDITIONAL_INFO",
-                "DOMINANT_POLLUTANT_CONCENTRATION",
-                "POLLUTANT_CONCENTRATION",
-            ],
-        }
-
-    def _create_forecast_payload(self):
-        """Create the payload for the forecast API call."""
-        now = datetime.now(timezone.utc)
-        end_time = now + timedelta(hours=self._forecast_length)
-        return {
-            "location": {"latitude": self._latitude, "longitude": self._longitude},
-            "period": {
-                "startTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "endTime": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
-        }
-
 
 async def async_setup_entry(
-    hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities
-):
-    """Set up Google AQI air quality sensor from a config entry."""
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities,
+) -> None:
+    """Set up Google AQI sensors from a config entry."""
     config = config_entry.data
-    async_add_entities(
-        [
-            GoogleAQIAirQualityEntity(
-                hass,
-                config_entry.entry_id,
-                api_key=config["api_key"],
-                latitude=config["latitude"],
-                longitude=config["longitude"],
-                get_additional_info=config.get("get_additional_info", False),
-                update_interval=config.get("interval", 3),
-                forecast_interval=config.get("forecast_interval", 6),
-                forecast_length=config.get("forecast_length", 24),
-            )
-        ],
-        update_before_add=True,
+
+    coordinator = GoogleAQICoordinator(
+        hass,
+        api_key=config["api_key"],
+        latitude=config["latitude"],
+        longitude=config["longitude"],
+        get_additional_info=config.get("get_additional_info", False),
+        update_interval=config.get("interval", 3),
+        forecast_interval=config.get("forecast_interval", 6),
+        forecast_length=config.get("forecast_length", 24),
     )
+    await coordinator.async_config_entry_first_refresh()
+
+    entities = [
+        GoogleAQISensor(coordinator, config_entry.entry_id, description)
+        for description in SENSOR_DESCRIPTIONS
+    ]
+
+    async_add_entities(entities)

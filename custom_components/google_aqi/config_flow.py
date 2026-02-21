@@ -17,11 +17,11 @@ class GoogleAQIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data_schema=self._get_form_schema(),
                     errors={"forecast_length": "max_length_96"},
                 )
-            if user_input["interval"] > 24 or user_input["interval"] < 1:
+            if user_input["interval"] > 24 or user_input["interval"] < 3:
                 return self.async_show_form(
                     step_id="user",
                     data_schema=self._get_form_schema(),
-                    errors={"interval": "invalid_interval"},
+                    errors={"interval": "invalid_update_interval"},
                 )
             if (
                 user_input["forecast_interval"] > 24
@@ -30,7 +30,7 @@ class GoogleAQIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_show_form(
                     step_id="user",
                     data_schema=self._get_form_schema(),
-                    errors={"forecast_interval": "invalid_interval"},
+                    errors={"forecast_interval": "invalid_forecast_interval"},
                 )
 
             # Save the configuration and create an entry
@@ -53,8 +53,8 @@ class GoogleAQIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required("api_key"): str,  # API key must be entered by the user
                 vol.Optional("latitude", default=default_latitude): float,
                 vol.Optional("longitude", default=default_longitude): float,
-                vol.Optional("interval", default=1): vol.All(
-                    int, vol.Range(min=1, max=24)
+                vol.Optional("interval", default=3): vol.All(
+                    int, vol.Range(min=3, max=24)
                 ),
                 vol.Optional("forecast_interval", default=6): vol.All(
                     int, vol.Range(min=1, max=24)
