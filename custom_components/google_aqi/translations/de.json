@@ -18,7 +18,7 @@
     },
     "error": {
       "max_length_96": "Die Prognoselänge darf 96 Stunden nicht überschreiten.",
-      "invalid_update_interval": "Das Aktualisierungsintervall muss zwischen 3 und 24 Stunden liegen.",
+      "invalid_update_interval": "Das Aktualisierungsintervall muss zwischen 1 und 24 Stunden liegen.",
       "invalid_forecast_interval": "Das Prognoseintervall muss zwischen 1 und 24 Stunden liegen."
     }
   },
