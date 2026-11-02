@@ -17,7 +17,7 @@ class GoogleAQIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data_schema=self._get_form_schema(),
                     errors={"forecast_length": "max_length_96"},
                 )
-            if user_input["interval"] > 24 or user_input["interval"] < 3:
+            if user_input["interval"] > 24 or user_input["interval"] < 1:
                 return self.async_show_form(
                     step_id="user",
                     data_schema=self._get_form_schema(),
@@ -54,7 +54,7 @@ class GoogleAQIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Optional("latitude", default=default_latitude): float,
                 vol.Optional("longitude", default=default_longitude): float,
                 vol.Optional("interval", default=3): vol.All(
-                    int, vol.Range(min=3, max=24)
+                    int, vol.Range(min=1, max=24)
                 ),
                 vol.Optional("forecast_interval", default=6): vol.All(
                     int, vol.Range(min=1, max=24)

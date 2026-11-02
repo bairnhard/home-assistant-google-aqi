@@ -22,7 +22,7 @@ _LOGGER = logging.getLogger(__name__)
 
 API_URL = "https://airquality.googleapis.com/v1/currentConditions:lookup"
 FORECAST_URL = "https://airquality.googleapis.com/v1/forecast:lookup"
-SCAN_INTERVAL = timedelta(hours=3)
+SCAN_INTERVAL = timedelta(hours=1)
 
 
 @dataclass(frozen=True, kw_only=True)
